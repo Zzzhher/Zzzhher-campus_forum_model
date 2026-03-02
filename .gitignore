@@ -1,0 +1,46 @@
+# IDE files
+.idea/
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Model weights (large files)
+models/model_weights/
+models/*.pt
+models/data/
+models/vocab/
+models/*.pth  # 补充：常见的 PyTorch 权重文件格式
+models/*.bin  # 补充：Transformer 类模型常用权重格式
+
+# Environment files
+.env
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE specific
+.vscode/
+*.swp
+*.swo
+*~
+
+# Build artifacts
+build/
+dist/
+*.egg-info/
+
+# Test files
+.pytest_cache/
+test-results/
+
+# Jupyter notebooks
+.ipynb_checkpoints/
+
+# Temporary files
+*.tmp
+*.temp
+
+# Log files
+*.log
