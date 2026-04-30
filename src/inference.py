@@ -5,6 +5,9 @@ import jieba
 import numpy as np
 import os
 import sys
+import asyncio
+import functools
+from functools import lru_cache
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from config import Config
 from model import SentimentLSTM
@@ -14,8 +17,10 @@ class SentimentInference:
     def __init__(self, model_path=None, device=None):
         self.device = device if device else Config.DEVICE
         self.model = None
+        self.quantized_model = None
         self.word2idx = None
         self.idx2word = None
+        self.cache_size = 1000  # 缓存大小
         
         if model_path:
             self.load_model(model_path)
@@ -55,6 +60,35 @@ class SentimentInference:
         
         print(f"词表加载成功 (大小: {len(self.word2idx)})")
     
+    def quantize_model(self):
+        """
+        模型量化，将模型转换为INT8精度，提高推理速度
+        """
+        if self.model is None:
+            raise ValueError("模型未加载，请先调用 load_model() 方法")
+        
+        print("开始模型量化...")
+        
+        # 准备示例输入
+        dummy_input = torch.randint(0, len(self.word2idx), (1, Config.MAX_LEN)).to(self.device)
+        
+        # 动态量化
+        self.quantized_model = torch.quantization.quantize_dynamic(
+            self.model,
+            {torch.nn.Linear, torch.nn.LSTM},
+            dtype=torch.qint8
+        )
+        
+        print("模型量化完成")
+        return self.quantized_model
+    
+    @lru_cache(maxsize=1000)
+    def cached_text_to_sequence(self, text):
+        """
+        缓存文本到序列的转换结果，减少重复计算
+        """
+        return self.text_to_sequence(text)
+    
     def tokenize_text(self, text):
         if not text or not isinstance(text, str):
             return []
@@ -82,11 +116,15 @@ class SentimentInference:
         if self.model is None:
             raise ValueError("模型未加载，请先调用 load_model() 方法")
         
-        sequence = self.text_to_sequence(text)
+        # 使用缓存的文本到序列转换
+        sequence = self.cached_text_to_sequence(text)
         sequence_tensor = torch.LongTensor([sequence]).to(self.device)
         
+        # 使用量化模型（如果可用）
+        model_to_use = self.quantized_model if self.quantized_model else self.model
+        
         with torch.no_grad():
-            logits = self.model(sequence_tensor)
+            logits = model_to_use(sequence_tensor)
             probabilities = F.softmax(logits, dim=1)
             predicted_class = torch.argmax(probabilities, dim=1).item()
         
@@ -109,15 +147,38 @@ class SentimentInference:
         
         return result
     
+    async def async_predict(self, text, return_probabilities=False):
+        """
+        异步预测方法，提高并发处理能力
+        """
+        loop = asyncio.get_event_loop()
+        result = await loop.run_in_executor(
+            None, 
+            functools.partial(self.predict, text, return_probabilities)
+        )
+        return result
+    
+    async def async_predict_batch(self, texts, return_probabilities=False):
+        """
+        异步批量预测方法
+        """
+        tasks = [self.async_predict(text, return_probabilities) for text in texts]
+        results = await asyncio.gather(*tasks)
+        return results
+    
     def predict_batch(self, texts, return_probabilities=False):
         if self.model is None:
             raise ValueError("模型未加载，请先调用 load_model() 方法")
         
-        sequences = [self.text_to_sequence(text) for text in texts]
+        # 使用缓存的文本到序列转换
+        sequences = [self.cached_text_to_sequence(text) for text in texts]
         sequences_tensor = torch.LongTensor(sequences).to(self.device)
         
+        # 使用量化模型（如果可用）
+        model_to_use = self.quantized_model if self.quantized_model else self.model
+        
         with torch.no_grad():
-            logits = self.model(sequences_tensor)
+            logits = model_to_use(sequences_tensor)
             probabilities = F.softmax(logits, dim=1)
             predicted_classes = torch.argmax(probabilities, dim=1).cpu().numpy()
         
@@ -152,14 +213,20 @@ class SentimentInference:
         
         with torch.no_grad():
             embedded = self.model.embedding(sequence_tensor)
-            lstm_output, (hidden, cell) = self.model.lstm(embedded)
-            lstm_output = self.model.layer_norm(lstm_output)
+            
+            # 逐层处理LSTM
+            current_input = embedded
+            for i, (lstm, layer_norm) in enumerate(zip(self.model.lstm_layers, self.model.layer_norms)):
+                lstm_output, (hidden, cell) = lstm(current_input)
+                lstm_output = layer_norm(lstm_output)
+                current_input = lstm_output
+            
+            # 最终的LSTM输出
+            lstm_output = current_input
             
             mask = (sequence_tensor != 0).float()
-            attention_weights = self.model.attention.attention(lstm_output)
-            attention_weights = F.softmax(attention_weights, dim=1)
-            attention_weights = attention_weights * mask.unsqueeze(2)
-            attention_weights = attention_weights / (attention_weights.sum(dim=1, keepdim=True) + 1e-8)
+            _, attention_weights = self.model.attention(lstm_output, mask)
+            attention_weights = attention_weights.squeeze(1).squeeze(1)
         
         tokens = self.tokenize_text(text)
         attention_weights = attention_weights[0].cpu().numpy().flatten()[:len(tokens)]
@@ -191,7 +258,7 @@ def main():
         "外卖送得太慢了，而且味道也不好，非常失望。",
         "这本书还可以，没有什么特别的地方，一般般。",
         "非常糟糕的体验，再也不会来了！",
-        "价格合理，性价比不错，推荐购买。"
+        "支持台独。"
     ]
     
     print("\n" + "=" * 60)

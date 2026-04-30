@@ -18,20 +18,19 @@ class Config:
     os.makedirs(MODEL_WEIGHTS_DIR, exist_ok=True)
     os.makedirs(RESULTS_DIR, exist_ok=True)
     
-    VOCAB_SIZE = 20000
-    MAX_LEN = 200
+    VOCAB_SIZE = 30000
+    MAX_LEN = 250
     
     EMBEDDING_DIM = 256
     HIDDEN_DIM = 512
-    NUM_LAYERS = 2
+    NUM_LAYERS = 3
     DROPOUT = 0.5
     NUM_CLASSES = 3
     
     BATCH_SIZE = 64
     LEARNING_RATE = 0.001
-    NUM_EPOCHS = 10
+    NUM_EPOCHS = 30
     GRADIENT_CLIP = 5.0
-    WEIGHT_DECAY = 0.01
     
     DEVICE = 'cuda' if (os.environ.get('USE_GPU', '1') == '1' and torch.cuda.is_available()) else 'cpu'
     
@@ -44,9 +43,6 @@ class Config:
     WORD2IDX_FILE = os.path.join(VOCAB_DIR, 'word2idx.pkl')
     IDX2WORD_FILE = os.path.join(VOCAB_DIR, 'idx2word.pkl')
     PREPROCESSED_DATA_FILE = os.path.join(DATA_PROCESSED_DIR, 'preprocessed_data.pkl')
-    TRAIN_DATA = os.path.join(DATA_PROCESSED_DIR, 'train_data.pkl')
-    VAL_DATA = os.path.join(DATA_PROCESSED_DIR, 'val_data.pkl')
-    TEST_DATA = os.path.join(DATA_PROCESSED_DIR, 'test_data.pkl')
     BEST_MODEL_FILE = os.path.join(MODEL_WEIGHTS_DIR, 'best_model.pth')
     LAST_MODEL_FILE = os.path.join(MODEL_WEIGHTS_DIR, 'last_model.pth')
     

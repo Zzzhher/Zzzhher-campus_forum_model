@@ -1,30 +1,75 @@
-from flask import Flask, request, jsonify
-from flask_cors import CORS
+from fastapi import FastAPI, HTTPException, Request, Depends
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field
+from typing import List, Optional, Dict, Any
 import os
 import sys
 import traceback
 from datetime import datetime
 import logging
 
+# 导入自定义模块
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from config import Config
 from inference import SentimentInference
-from moderation import ModerationEngine, ContentType
-from sensitive_words import get_sensitive_word_manager
+from moderation import ModerationEngine
+from sensitive_words import get_sensitive_word_manager, WordCategory
 
-app = Flask(__name__)
-CORS(app)
-
+# 配置日志
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
 
+# 创建FastAPI应用
+app = FastAPI(
+    title="校园论坛内容审核系统",
+    description="基于LSTM的情感分析和内容审核API",
+    version="2.0.0"
+)
+
+# 配置CORS
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # 在生产环境中应该设置具体的域名
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# 全局变量
 inference_engine = None
 moderation_engine = None
 
+# 数据模型
+class PredictRequest(BaseModel):
+    text: str = Field(..., description="待预测的文本", min_length=1)
+    return_probabilities: Optional[bool] = Field(False, description="是否返回概率分布")
 
+class PredictBatchRequest(BaseModel):
+    texts: List[str] = Field(..., description="待预测的文本列表", min_items=1, max_items=100)
+    return_probabilities: Optional[bool] = Field(False, description="是否返回概率分布")
+
+class ModerateRequest(BaseModel):
+    text: str = Field(..., description="待审核的文本", min_length=1)
+
+class ModerateBatchRequest(BaseModel):
+    texts: List[str] = Field(..., description="待审核的文本列表", min_items=1, max_items=100)
+
+# 敏感词管理数据模型
+class AddKeywordRequest(BaseModel):
+    word: str = Field(..., description="敏感词", min_length=1)
+    category: str = Field(..., description="敏感词类别")
+    severity: Optional[int] = Field(1, description="严重程度", ge=1, le=3)
+
+class RemoveKeywordRequest(BaseModel):
+    word: str = Field(..., description="敏感词", min_length=1)
+
+class WordCloudRequest(BaseModel):
+    limit: Optional[int] = Field(100, description="返回词的数量限制", ge=1, le=1000)
+
+# 加载推理引擎
 def load_inference_engine():
     global inference_engine, moderation_engine
     try:
@@ -32,7 +77,7 @@ def load_inference_engine():
         if not os.path.exists(model_path):
             logger.error(f"模型文件不存在: {model_path}")
             return False
-
+        
         inference_engine = SentimentInference(model_path)
         moderation_engine = ModerationEngine(inference_engine)
         logger.info("推理引擎加载成功")
@@ -43,148 +88,94 @@ def load_inference_engine():
         logger.error(traceback.format_exc())
         return False
 
+# 启动时加载引擎
+@app.on_event("startup")
+def startup_event():
+    logger.info("=" * 60)
+    logger.info("启动情感分析API服务")
+    logger.info("=" * 60)
+    
+    if not load_inference_engine():
+        logger.error("无法加载推理引擎，服务启动失败")
+        raise Exception("无法加载推理引擎")
+    
+    logger.info(f"模型配置:")
+    logger.info(f"  词表大小: {Config.VOCAB_SIZE}")
+    logger.info(f"  最大序列长度: {Config.MAX_LEN}")
+    logger.info(f"  分类数: {Config.NUM_CLASSES}")
+    logger.info(f"  设备: {Config.DEVICE}")
 
-@app.route('/health', methods=['GET'])
+# 健康检查
+@app.get("/health", summary="健康检查", description="检查服务和模型状态")
 def health_check():
-    return jsonify({
+    return {
         'status': 'healthy',
         'timestamp': datetime.now().isoformat(),
         'model_loaded': inference_engine is not None,
         'moderation_loaded': moderation_engine is not None
-    })
+    }
 
-
-@app.route('/predict', methods=['POST'])
-def predict():
+# 单条预测
+@app.post("/predict", summary="单条文本预测", description="对单条文本进行情感分析预测")
+def predict(request: PredictRequest):
     try:
-        data = request.get_json()
-
-        if not data or 'text' not in data:
-            return jsonify({
-                'error': '缺少必需参数: text',
-                'code': 400
-            }), 400
-
-        text = data['text']
-
-        if not isinstance(text, str):
-            return jsonify({
-                'error': 'text参数必须是字符串',
-                'code': 400
-            }), 400
-
-        if not text.strip():
-            return jsonify({
-                'error': 'text参数不能为空',
-                'code': 400
-            }), 400
-
-        return_probabilities = data.get('return_probabilities', False)
-
+        text = request.text
+        return_probabilities = request.return_probabilities
+        
         result = inference_engine.predict(text, return_probabilities=return_probabilities)
-
+        
         response = {
             'success': True,
             'data': result,
             'timestamp': datetime.now().isoformat()
         }
-
+        
         logger.info(f"预测成功: {text[:50]}... -> {result['predicted_label']}")
-
-        return jsonify(response), 200
-
+        
+        return response
     except Exception as e:
         logger.error(f"预测失败: {str(e)}")
         logger.error(traceback.format_exc())
-        return jsonify({
-            'error': f'预测失败: {str(e)}',
-            'code': 500
-        }), 500
+        raise HTTPException(status_code=500, detail=f'预测失败: {str(e)}')
 
-
-@app.route('/predict/batch', methods=['POST'])
-def predict_batch():
+# 批量预测
+@app.post("/predict/batch", summary="批量文本预测", description="对多条文本进行情感分析预测")
+def predict_batch(request: PredictBatchRequest):
     try:
-        data = request.get_json()
-
-        if not data or 'texts' not in data:
-            return jsonify({
-                'error': '缺少必需参数: texts',
-                'code': 400
-            }), 400
-
-        texts = data['texts']
-
-        if not isinstance(texts, list):
-            return jsonify({
-                'error': 'texts参数必须是列表',
-                'code': 400
-            }), 400
-
-        if len(texts) == 0:
-            return jsonify({
-                'error': 'texts列表不能为空',
-                'code': 400
-            }), 400
-
+        texts = request.texts
+        return_probabilities = request.return_probabilities
+        
         if len(texts) > 100:
-            return jsonify({
-                'error': '批量预测最多支持100条文本',
-                'code': 400
-            }), 400
-
-        return_probabilities = data.get('return_probabilities', False)
-
+            raise HTTPException(status_code=400, detail="批量预测最多支持100条文本")
+        
         results = inference_engine.predict_batch(texts, return_probabilities=return_probabilities)
-
+        
         response = {
             'success': True,
             'data': results,
             'count': len(results),
             'timestamp': datetime.now().isoformat()
         }
-
+        
         logger.info(f"批量预测成功: {len(texts)}条文本")
-
-        return jsonify(response), 200
-
+        
+        return response
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"批量预测失败: {str(e)}")
         logger.error(traceback.format_exc())
-        return jsonify({
-            'error': f'批量预测失败: {str(e)}',
-            'code': 500
-        }), 500
+        raise HTTPException(status_code=500, detail=f'批量预测失败: {str(e)}')
 
-
-@app.route('/analyze', methods=['POST'])
-def analyze():
+# 文本分析
+@app.post("/analyze", summary="文本分析", description="对文本进行情感分析和注意力权重分析")
+def analyze(request: PredictRequest):
     try:
-        data = request.get_json()
-
-        if not data or 'text' not in data:
-            return jsonify({
-                'error': '缺少必需参数: text',
-                'code': 400
-            }), 400
-
-        text = data['text']
-
-        if not isinstance(text, str):
-            return jsonify({
-                'error': 'text参数必须是字符串',
-                'code': 400
-            }), 400
-
-        if not text.strip():
-            return jsonify({
-                'error': 'text参数不能为空',
-                'code': 400
-            }), 400
-
+        text = request.text
+        
         prediction_result = inference_engine.predict(text, return_probabilities=True)
         attention_result = inference_engine.get_attention_weights(text)
-
+        
         response = {
             'success': True,
             'data': {
@@ -193,29 +184,22 @@ def analyze():
             },
             'timestamp': datetime.now().isoformat()
         }
-
+        
         logger.info(f"分析成功: {text[:50]}... -> {prediction_result['predicted_label']}")
-
-        return jsonify(response), 200
-
+        
+        return response
     except Exception as e:
         logger.error(f"分析失败: {str(e)}")
         logger.error(traceback.format_exc())
-        return jsonify({
-            'error': f'分析失败: {str(e)}',
-            'code': 500
-        }), 500
+        raise HTTPException(status_code=500, detail=f'分析失败: {str(e)}')
 
-
-@app.route('/model/info', methods=['GET'])
+# 模型信息
+@app.get("/model/info", summary="模型信息", description="获取模型配置信息")
 def model_info():
     try:
         if inference_engine is None:
-            return jsonify({
-                'error': '模型未加载',
-                'code': 503
-            }), 503
-
+            raise HTTPException(status_code=503, detail="模型未加载")
+        
         info = {
             'vocab_size': Config.VOCAB_SIZE,
             'max_len': Config.MAX_LEN,
@@ -227,292 +211,194 @@ def model_info():
             'device': Config.DEVICE,
             'model_path': Config.BEST_MODEL_FILE
         }
-
-        return jsonify({
+        
+        return {
             'success': True,
             'data': info
-        }), 200
-
+        }
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"获取模型信息失败: {str(e)}")
-        return jsonify({
-            'error': f'获取模型信息失败: {str(e)}',
-            'code': 500
-        }), 500
+        raise HTTPException(status_code=500, detail=f'获取模型信息失败: {str(e)}')
 
-
-# ==================== 审核相关接口 ====================
-
-@app.route('/moderate', methods=['POST'])
-def moderate():
-    """
-    内容审核接口
-    请求参数:
-    - text: 待审核文本 (必需)
-    - content_type: 内容类型 (可选, 默认comment) [topic/comment/username/signature]
-    """
+# 单条审核
+@app.post("/moderate", summary="单条文本审核", description="对单条文本进行内容审核")
+def moderate(request: ModerateRequest):
     try:
-        data = request.get_json()
-
-        if not data or 'text' not in data:
-            return jsonify({
-                'error': '缺少必需参数: text',
-                'code': 400
-            }), 400
-
-        text = data['text']
-
-        if not isinstance(text, str):
-            return jsonify({
-                'error': 'text参数必须是字符串',
-                'code': 400
-            }), 400
-
-        if not text.strip():
-            return jsonify({
-                'error': 'text参数不能为空',
-                'code': 400
-            }), 400
-
-        # 解析内容类型
-        content_type_str = data.get('content_type', 'comment')
-        try:
-            content_type = ContentType(content_type_str)
-        except ValueError:
-            return jsonify({
-                'error': f'无效的内容类型: {content_type_str}',
-                'code': 400
-            }), 400
-
-        result = moderation_engine.moderate(text, content_type)
-
+        text = request.text
+        
+        result = moderation_engine.moderate(text)
+        
         response = {
             'success': True,
             'data': result.to_dict(),
             'timestamp': datetime.now().isoformat()
         }
-
-        logger.info(f"审核成功: {text[:50]}... -> {result.action.value}")
-
-        return jsonify(response), 200
-
+        
+        logger.info(f"审核成功: {text[:50]}... -> {result.action.value if result.action else 'N/A'}")
+        
+        return response
     except Exception as e:
         logger.error(f"审核失败: {str(e)}")
         logger.error(traceback.format_exc())
-        return jsonify({
-            'error': f'审核失败: {str(e)}',
-            'code': 500
-        }), 500
+        raise HTTPException(status_code=500, detail=f'审核失败: {str(e)}')
 
-
-@app.route('/moderate/batch', methods=['POST'])
-def moderate_batch():
-    """
-    批量审核接口
-    请求参数:
-    - texts: 待审核文本列表 (必需)
-    - content_type: 内容类型 (可选, 默认comment)
-    """
+# 批量审核
+@app.post("/moderate/batch", summary="批量文本审核", description="对多条文本进行内容审核")
+def moderate_batch(request: ModerateBatchRequest):
     try:
-        data = request.get_json()
-
-        if not data or 'texts' not in data:
-            return jsonify({
-                'error': '缺少必需参数: texts',
-                'code': 400
-            }), 400
-
-        texts = data['texts']
-
-        if not isinstance(texts, list):
-            return jsonify({
-                'error': 'texts参数必须是列表',
-                'code': 400
-            }), 400
-
-        if len(texts) == 0:
-            return jsonify({
-                'error': 'texts列表不能为空',
-                'code': 400
-            }), 400
-
+        texts = request.texts
+        
         if len(texts) > 100:
-            return jsonify({
-                'error': '批量审核最多支持100条文本',
-                'code': 400
-            }), 400
-
-        content_type_str = data.get('content_type', 'comment')
-        try:
-            content_type = ContentType(content_type_str)
-        except ValueError:
-            return jsonify({
-                'error': f'无效的内容类型: {content_type_str}',
-                'code': 400
-            }), 400
-
-        results = moderation_engine.moderate_batch(texts, content_type)
-
+            raise HTTPException(status_code=400, detail="批量审核最多支持100条文本")
+        
+        results = moderation_engine.moderate_batch(texts)
+        
         response = {
             'success': True,
             'data': [result.to_dict() for result in results],
             'count': len(results),
             'timestamp': datetime.now().isoformat()
         }
-
+        
         logger.info(f"批量审核成功: {len(texts)}条文本")
-
-        return jsonify(response), 200
-
+        
+        return response
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"批量审核失败: {str(e)}")
         logger.error(traceback.format_exc())
-        return jsonify({
-            'error': f'批量审核失败: {str(e)}',
-            'code': 500
-        }), 500
+        raise HTTPException(status_code=500, detail=f'批量审核失败: {str(e)}')
 
-
-@app.route('/moderation/config', methods=['GET'])
-def get_moderation_config():
-    """获取审核策略配置"""
+# 审核统计
+@app.get("/moderation/stats", summary="审核统计", description="获取审核统计信息")
+def moderation_stats():
     try:
         if moderation_engine is None:
-            return jsonify({
-                'error': '审核引擎未加载',
-                'code': 503
-            }), 503
-
-        config = moderation_engine.get_config()
-
-        return jsonify({
+            raise HTTPException(status_code=503, detail="审核引擎未加载")
+        
+        stats = moderation_engine.get_moderation_stats()
+        
+        return {
             'success': True,
-            'data': config
-        }), 200
-
+            'data': stats
+        }
+    except HTTPException:
+        raise
     except Exception as e:
-        logger.error(f"获取审核配置失败: {str(e)}")
-        return jsonify({
-            'error': f'获取审核配置失败: {str(e)}',
-            'code': 500
-        }), 500
+        logger.error(f"获取审核统计失败: {str(e)}")
+        raise HTTPException(status_code=500, detail=f'获取审核统计失败: {str(e)}')
 
-
-@app.route('/moderation/config', methods=['POST'])
-def update_moderation_config():
-    """更新审核策略配置"""
+# 敏感词云数据
+@app.get("/sensitive/wordcloud", summary="敏感词云数据", description="获取高频敏感词云数据")
+def get_word_cloud(limit: int = 100):
     try:
-        if moderation_engine is None:
-            return jsonify({
-                'error': '审核引擎未加载',
-                'code': 503
-            }), 503
-
-        data = request.get_json()
-        if not data:
-            return jsonify({
-                'error': '请求体不能为空',
-                'code': 400
-            }), 400
-
-        moderation_engine.update_config(**data)
-
-        return jsonify({
-            'success': True,
-            'message': '审核策略已更新',
-            'data': moderation_engine.get_config()
-        }), 200
-
-    except Exception as e:
-        logger.error(f"更新审核配置失败: {str(e)}")
-        return jsonify({
-            'error': f'更新审核配置失败: {str(e)}',
-            'code': 500
-        }), 500
-
-
-@app.route('/sensitive_words/check', methods=['POST'])
-def check_sensitive_words():
-    """敏感词检测接口"""
-    try:
-        data = request.get_json()
-
-        if not data or 'text' not in data:
-            return jsonify({
-                'error': '缺少必需参数: text',
-                'code': 400
-            }), 400
-
-        text = data['text']
-
-        if not isinstance(text, str):
-            return jsonify({
-                'error': 'text参数必须是字符串',
-                'code': 400
-            }), 400
-
         swm = get_sensitive_word_manager()
-        result = swm.check(text)
-
-        return jsonify({
+        word_cloud_data = swm.get_word_cloud_data(limit)
+        
+        return {
             'success': True,
-            'data': {
-                'is_match': result.is_match,
-                'matched_words': result.matched_words,
-                'categories': [cat.value for cat in result.categories],
-                'risk_score': result.risk_score,
-                'is_severe': swm.is_severe(result)
-            },
+            'data': word_cloud_data,
+            'count': len(word_cloud_data),
             'timestamp': datetime.now().isoformat()
-        }), 200
-
+        }
     except Exception as e:
-        logger.error(f"敏感词检测失败: {str(e)}")
-        return jsonify({
-            'error': f'敏感词检测失败: {str(e)}',
-            'code': 500
-        }), 500
+        logger.error(f"获取敏感词云数据失败: {str(e)}")
+        raise HTTPException(status_code=500, detail=f'获取敏感词云数据失败: {str(e)}')
 
-
-@app.route('/sensitive_words/stats', methods=['GET'])
-def get_sensitive_words_stats():
-    """获取敏感词库统计信息"""
+# 敏感词库统计
+@app.get("/sensitive/stats", summary="敏感词库统计", description="获取敏感词库统计信息")
+def get_sensitive_stats():
     try:
         swm = get_sensitive_word_manager()
         stats = swm.get_stats()
-
-        return jsonify({
+        
+        return {
             'success': True,
             'data': stats
-        }), 200
-
+        }
     except Exception as e:
-        logger.error(f"获取敏感词统计失败: {str(e)}")
-        return jsonify({
-            'error': f'获取敏感词统计失败: {str(e)}',
-            'code': 500
-        }), 500
+        logger.error(f"获取敏感词库统计失败: {str(e)}")
+        raise HTTPException(status_code=500, detail=f'获取敏感词库统计失败: {str(e)}')
 
+# 添加敏感词
+@app.post("/sensitive/add", summary="添加敏感词", description="添加新的敏感词")
+def add_sensitive_word(request: AddKeywordRequest):
+    try:
+        swm = get_sensitive_word_manager()
+        
+        # 验证类别是否有效
+        try:
+            category = WordCategory(request.category)
+        except ValueError:
+            raise HTTPException(status_code=400, detail=f'无效的敏感词类别: {request.category}')
+        
+        success = swm.add_keyword(request.word, category, request.severity)
+        
+        if success:
+            logger.info(f"添加敏感词成功: {request.word} (类别: {category.value})")
+            return {
+                'success': True,
+                'message': f"敏感词 '{request.word}' 添加成功",
+                'timestamp': datetime.now().isoformat()
+            }
+        else:
+            raise HTTPException(status_code=400, detail="添加敏感词失败")
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"添加敏感词失败: {str(e)}")
+        raise HTTPException(status_code=500, detail=f'添加敏感词失败: {str(e)}')
 
-@app.errorhandler(404)
-def not_found(error):
-    return jsonify({
-        'error': '接口不存在',
-        'code': 404
-    }), 404
+# 移除敏感词
+@app.post("/sensitive/remove", summary="移除敏感词", description="移除敏感词")
+def remove_sensitive_word(request: RemoveKeywordRequest):
+    try:
+        swm = get_sensitive_word_manager()
+        
+        success = swm.remove_keyword(request.word)
+        
+        if success:
+            logger.info(f"移除敏感词成功: {request.word}")
+            return {
+                'success': True,
+                'message': f"敏感词 '{request.word}' 移除成功",
+                'timestamp': datetime.now().isoformat()
+            }
+        else:
+            raise HTTPException(status_code=404, detail=f"敏感词 '{request.word}' 不存在")
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"移除敏感词失败: {str(e)}")
+        raise HTTPException(status_code=500, detail=f'移除敏感词失败: {str(e)}')
 
-
-@app.errorhandler(500)
-def internal_error(error):
-    return jsonify({
-        'error': '服务器内部错误',
-        'code': 500
-    }), 500
-
+# 获取敏感词类别
+@app.get("/sensitive/categories", summary="敏感词类别", description="获取所有敏感词类别")
+def get_sensitive_categories():
+    try:
+        categories = [{
+            'value': cat.value,
+            'name': cat.name
+        } for cat in WordCategory]
+        
+        return {
+            'success': True,
+            'data': categories
+        }
+    except Exception as e:
+        logger.error(f"获取敏感词类别失败: {str(e)}")
+        raise HTTPException(status_code=500, detail=f'获取敏感词类别失败: {str(e)}')
 
 if __name__ == '__main__':
-    if load_inference_engine():
-        app.run(host='0.0.0.0', port=5000, debug=False)
-    else:
-        logger.error("启动失败：无法加载推理引擎")
-        sys.exit(1)
+    import uvicorn
+    
+    host = os.environ.get('HOST', 'localhost')
+    port = int(os.environ.get('PORT', 8000))
+    
+    logger.info(f"服务启动在: http://{host}:{port}")
+    logger.info(f"API文档地址: http://{host}:{port}/docs")
+    
+    uvicorn.run(app, host='localhost', port=port, log_config=None)

@@ -7,6 +7,7 @@ import jieba
 from tqdm import tqdm
 from collections import Counter
 import random
+import torch
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from config import Config
@@ -18,6 +19,9 @@ class DataPreprocessor:
         self.word2idx = {'<PAD>': 0, '<UNK>': 1}
         self.idx2word = {0: '<PAD>', 1: '<UNK>'}
         self.word_freq = Counter()
+        self.pretrained_embeddings = None
+        
+        pass
         
     def augment_neutral_data(self, df):
         neutral_df = df[df['label'] == 2].copy()
@@ -97,9 +101,36 @@ class DataPreprocessor:
         text = str(text).strip()
         if not text:
             return []
-        tokens = list(jieba.cut(text))
+        # 使用jieba的精确模式分词
+        tokens = list(jieba.cut(text, cut_all=False))
         tokens = [token for token in tokens if token.strip()]
         return tokens
+    
+    def load_pretrained_embeddings(self, embedding_path=None):
+        """
+        加载预训练词向量
+        这里使用随机初始化作为示例，实际应用中可以加载预训练的词向量文件
+        """
+        print("\n加载预训练词向量...")
+        
+        # 初始化词向量矩阵
+        vocab_size = len(self.word2idx)
+        embedding_dim = self.config.EMBEDDING_DIM
+        
+        # 随机初始化词向量
+        embeddings = np.random.randn(vocab_size, embedding_dim)
+        embeddings[0] = np.zeros(embedding_dim)  # <PAD>的词向量为0
+        
+        # 这里可以添加加载预训练词向量的逻辑
+        # 例如，加载Word2Vec或GloVe预训练词向量
+        # if embedding_path and os.path.exists(embedding_path):
+        #     # 加载预训练词向量并更新embeddings矩阵
+        #     pass
+        
+        self.pretrained_embeddings = torch.tensor(embeddings, dtype=torch.float32)
+        print(f"预训练词向量加载完成，形状: {self.pretrained_embeddings.shape}")
+        
+        return self.pretrained_embeddings
     
     def build_vocab(self, texts):
         print("\n正在构建词表...")
@@ -226,6 +257,7 @@ class DataPreprocessor:
         df = self.preprocess()
         train_df, val_df, test_df = self.split_data(df)
         self.save_vocab()
+        self.load_pretrained_embeddings()
         self.save_data(train_df, val_df, test_df)
         
         print("\n" + "=" * 50)
